@@ -1,324 +1,266 @@
 import os
 import sys
-import json
 import shutil
 import zipfile
-import threading
 import subprocess
-from flask import Flask, request, jsonify, send_file, render_template_string
+import threading
+from typing import List, Optional
+from pathlib import Path
 
-app = Flask(__name__)
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Query
+from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-# যে ডিরেক্টরিতে প্রজেক্টের ফাইলগুলো থাকবে
-WORKSPACE_DIR = os.path.abspath("./server_workspace")
-os.makedirs(WORKSPACE_DIR, exist_ok=True)
+app = FastAPI(title="Control Panel API")
 
-# ডিফল্ট একটি main.py ফাইল তৈরি করে রাখা যাতে শুরুতেই রান করা যায়
-default_main = os.path.join(WORKSPACE_DIR, "main.py")
-if not os.path.exists(default_main):
-    with open(default_main, "w", encoding="utf-8") as f:
-        f.write('import time\n\nprint("Server process started!")\nwhile True:\n    print("Server heartbeat running...")\n    time.sleep(3)\n')
+# CORS এনাবল করা
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-CONFIG_FILE = os.path.join(WORKSPACE_DIR, ".panel_config.json")
+# ওয়ার্কস্পেস পাথ (যেখানে ফাইল তৈরি/রান হবে)
+BASE_DIR = Path(__file__).resolve().parent
+WORKSPACE_DIR = BASE_DIR / "workspace"
+WORKSPACE_DIR.mkdir(exist_ok=True)
 
-# সার্ভার প্রসেস ও লগ ম্যানেজমেন্ট
-server_process = None
-server_logs = []
-logs_lock = threading.Lock()
-MAX_LOG_LINES = 1000
+# গ্লোবাল স্টেট
+logs_buffer = []
+server_process: Optional[subprocess.Popen] = None
+startup_config = {
+    "main_file": "main.py",
+    "req_file": "requirements.txt"
+}
 
-def append_log(text):
-    global server_logs
-    with logs_lock:
-        server_logs.append(text)
-        if len(server_logs) > MAX_LOG_LINES:
-            server_logs = server_logs[-MAX_LOG_LINES:]
+# --- হেল্পার ফাংশন: পাথ সিকিউরিটি চেক ---
+def get_safe_path(rel_path: str) -> Path:
+    target = (WORKSPACE_DIR / rel_path.strip("/\\")).resolve()
+    if not str(target).startswith(str(WORKSPACE_DIR.resolve())):
+        raise HTTPException(status_code=400, detail="Invalid path access")
+    return target
 
-def get_config():
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {"main_file": "main.py", "req_file": "requirements.txt"}
+def append_log(text: str):
+    logs_buffer.append(text)
+    if len(logs_buffer) > 1000:
+        logs_buffer.pop(0)
 
-def save_config(cfg):
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2)
-
-def stream_process_output(proc):
+def log_reader_thread(proc):
     for line in iter(proc.stdout.readline, ''):
         append_log(line)
     proc.stdout.close()
-    proc.wait()
-    append_log(f"\n[Process terminated with exit code {proc.returncode}]\n")
 
-def safe_path(relative_path):
-    """পাথ ট্রাভার্সাল (Directory Traversal) প্রতিরোধ করার জন্য সেফ পাথ হ্যান্ডলার"""
-    if not relative_path:
-        return WORKSPACE_DIR
-    target = os.path.abspath(os.path.join(WORKSPACE_DIR, relative_path))
-    if not target.startswith(WORKSPACE_DIR):
-        raise ValueError("Invalid directory path access!")
-    return target
+# --- Pydantic মডেলসমূহ ---
+class CommandRequest(BaseModel):
+    cmd: str
+    server_id: str
+
+class FileSaveRequest(BaseModel):
+    path: str
+    content: str
+
+class FolderCreateRequest(BaseModel):
+    path: str
+    folder_name: str
+
+class RenameRequest(BaseModel):
+    old_path: str
+    new_path: str
+
+class ExtractRequest(BaseModel):
+    file_path: str
+    target_path: Optional[str] = ""
+
+class DeleteRequest(BaseModel):
+    path: str
+
+class StartupRequest(BaseModel):
+    main_file: str
+    req_file: str
 
 
-# ==========================================
-# 1. FRONTEND ROUTE
-# ==========================================
-@app.route("/")
-def index():
-    # একই ডিরেক্টরিতে index.html থাকলে সেটি লোড হবে
-    if os.path.exists("index.html"):
-        return send_file("index.html")
-    return "<h3>Error: 'index.html' not found in the current directory!</h3>"
+# ==================== ১. ফ্রন্টএন্ড UI রাউট ====================
+@app.get("/", response_class=HTMLResponse)
+async def serve_index():
+    index_file = BASE_DIR / "index.html"
+    if not index_file.exists():
+        return HTMLResponse("<h3>index.html file not found!</h3>", status_code=404)
+    return FileResponse(index_file)
 
 
-# ==========================================
-# 2. SERVER CONTROL ENDPOINTS
-# ==========================================
-@app.route("/api/start/<server_id>", methods=["POST"])
-def start_server(server_id):
+# ==================== ২. সার্ভার কন্ট্রোল API ====================
+@app.post("/api/start/{server_id}")
+async def start_server(server_id: str):
     global server_process
     if server_process and server_process.poll() is None:
-        return jsonify({"message": "Server is already running"}), 200
+        return {"message": "Server is already running"}
 
-    cfg = get_config()
-    main_script = cfg.get("main_file", "main.py")
-    script_full_path = safe_path(main_script)
+    main_script = get_safe_path(startup_config["main_file"])
+    if not main_script.exists():
+        # ফাইল না থাকলে একটি ডেমো ফাইল বানিয়ে নেবে
+        main_script.write_text("import time\nprint('Server started successfully!')\nwhile True:\n    time.sleep(2)\n    print('Running...')\n")
 
-    if not os.path.exists(script_full_path):
-        return jsonify({"error": f"Entrypoint '{main_script}' not found!"}), 400
+    cmd = [sys.executable, "-u", str(main_script)]
+    server_process = subprocess.Popen(
+        cmd,
+        cwd=WORKSPACE_DIR,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1
+    )
+    threading.Thread(target=log_reader_thread, args=(server_process,), daemon=True).start()
+    append_log(f"\n--- [Started {startup_config['main_file']}] ---\n")
+    return {"status": "started"}
 
-    append_log(f"\n>>> Starting python {main_script}...\n")
+@app.post("/api/stop/{server_id}")
+async def stop_server(server_id: str):
+    global server_process
+    if server_process and server_process.poll() is None:
+        server_process.terminate()
+        server_process = None
+        append_log("\n--- [Server Stopped] ---\n")
+        return {"status": "stopped"}
+    return {"message": "Server is not running"}
+
+@app.post("/api/restart/{server_id}")
+async def restart_server(server_id: str):
+    await stop_server(server_id)
+    return await start_server(server_id)
+
+@app.get("/api/logs/{server_id}")
+async def get_logs(server_id: str):
+    return {"logs": "".join(logs_buffer)}
+
+@app.post("/api/clear_logs/{server_id}")
+async def clear_logs(server_id: str):
+    global logs_buffer
+    logs_buffer = []
+    return {"status": "cleared"}
+
+
+# ==================== ৩. টার্মিনাল কমান্ড API ====================
+@app.post("/api/command")
+async def execute_command(req: CommandRequest):
+    append_log(f"\n$ {req.cmd}\n")
     try:
-        server_process = subprocess.Popen(
-            [sys.executable, script_full_path],
+        result = subprocess.run(
+            req.cmd,
+            shell=True,
             cwd=WORKSPACE_DIR,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            bufsize=1,
-            universal_newlines=True
+            timeout=30
         )
-        t = threading.Thread(target=stream_process_output, args=(server_process,), daemon=True)
-        t.start()
-        return jsonify({"message": "Server started successfully"}), 200
+        append_log(result.stdout)
+    except subprocess.TimeoutExpired:
+        append_log("Command timed out.\n")
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/api/stop/<server_id>", methods=["POST"])
-def stop_server(server_id):
-    global server_process
-    if server_process and server_process.poll() is None:
-        try:
-            server_process.terminate()
-            server_process.wait(timeout=3)
-        except Exception:
-            server_process.kill()
-        append_log("\n>>> Server process stopped by user.\n")
-        server_process = None
-        return jsonify({"message": "Server stopped"}), 200
-    return jsonify({"message": "Server is not running"}), 200
-
-@app.route("/api/restart/<server_id>", methods=["POST"])
-def restart_server(server_id):
-    stop_server(server_id)
-    return start_server(server_id)
+        append_log(f"Error: {str(e)}\n")
+    return {"status": "executed"}
 
 
-# ==========================================
-# 3. TERMINAL LOGS & COMMANDS
-# ==========================================
-@app.route("/api/logs/<server_id>", methods=["GET"])
-def get_logs(server_id):
-    with logs_lock:
-        output = "".join(server_logs)
-    return jsonify({"logs": output})
+# ==================== ৪. ফাইল ম্যানেজার API ====================
+@app.get("/api/files/{server_id}")
+async def list_files(server_id: str, path: str = Query("")):
+    dir_path = get_safe_path(path)
+    if not dir_path.exists() or not dir_path.is_dir():
+        raise HTTPException(status_code=404, detail="Directory not found")
 
-@app.route("/api/clear_logs/<server_id>", methods=["POST"])
-def clear_logs(server_id):
-    global server_logs
-    with logs_lock:
-        server_logs.clear()
-    return jsonify({"message": "Logs cleared"}), 200
+    items = []
+    for item in dir_path.iterdir():
+        items.append({
+            "name": item.name,
+            "is_dir": item.is_dir()
+        })
+    return {"files": items}
 
-@app.route("/api/command", methods=["POST"])
-def run_command():
-    data = request.get_json() or {}
-    cmd = data.get("cmd", "").strip()
-    if not cmd:
-        return jsonify({"error": "Command is empty"}), 400
-
-    append_log(f"\n$ {cmd}\n")
-
-    def execute_cmd(command):
-        try:
-            proc = subprocess.Popen(
-                command,
-                cwd=WORKSPACE_DIR,
-                shell=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1
-            )
-            for line in iter(proc.stdout.readline, ''):
-                append_log(line)
-            proc.stdout.close()
-            proc.wait()
-        except Exception as err:
-            append_log(f"Command Error: {str(err)}\n")
-
-    threading.Thread(target=execute_cmd, args=(cmd,), daemon=True).start()
-    return jsonify({"message": "Command started"}), 200
-
-
-# ==========================================
-# 4. FILE MANAGER ENDPOINTS
-# ==========================================
-@app.route("/api/files/<server_id>", methods=["GET"])
-def list_files(server_id):
-    path_param = request.args.get("path", "").strip()
+@app.get("/api/file/{server_id}")
+async def read_file(server_id: str, path: str = Query(...)):
+    file_path = get_safe_path(path)
+    if not file_path.exists() or file_path.is_dir():
+        raise HTTPException(status_code=404, detail="File not found")
     try:
-        dir_path = safe_path(path_param)
-        if not os.path.exists(dir_path) or not os.path.isdir(dir_path):
-            return jsonify({"files": []}), 200
+        content = file_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        content = "[Binary or unsupported file format]"
+    return {"content": content}
 
-        items = []
-        for name in os.listdir(dir_path):
-            if name.startswith("."): # লুকানো ফাইল বাদ দেওয়া
-                continue
-            item_path = os.path.join(dir_path, name)
-            items.append({
-                "name": name,
-                "is_dir": os.path.isdir(item_path)
-            })
-        return jsonify({"files": items})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+@app.post("/api/file/{server_id}")
+async def save_file(server_id: str, req: FileSaveRequest):
+    file_path = get_safe_path(req.path)
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text(req.content, encoding="utf-8")
+    return {"status": "saved"}
 
-@app.route("/api/file/<server_id>", methods=["GET", "POST", "DELETE"])
-def handle_file(server_id):
-    if request.method == "GET":
-        path_param = request.args.get("path", "").strip()
-        try:
-            file_path = safe_path(path_param)
-            if not os.path.isfile(file_path):
-                return jsonify({"error": "File not found"}), 404
-            with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-                content = f.read()
-            return jsonify({"content": content})
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
+@app.delete("/api/file/{server_id}")
+async def delete_item(server_id: str, req: DeleteRequest):
+    target = get_safe_path(req.path)
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="Item not found")
+    if target.is_dir():
+        shutil.rmtree(target)
+    else:
+        target.unlink()
+    return {"status": "deleted"}
 
-    data = request.get_json() or {}
-    rel_path = data.get("path", "").strip()
+@app.post("/api/create_folder/{server_id}")
+async def create_folder(server_id: str, req: FolderCreateRequest):
+    target = get_safe_path(req.path)
+    target.mkdir(parents=True, exist_ok=True)
+    return {"status": "created"}
 
-    if request.method == "POST":
-        content = data.get("content", "")
-        try:
-            file_path = safe_path(rel_path)
-            os.makedirs(os.path.dirname(file_path), exist_ok=True)
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(content)
-            return jsonify({"message": "File saved"}), 200
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
+@app.post("/api/rename/{server_id}")
+async def rename_item(server_id: str, req: RenameRequest):
+    old_target = get_safe_path(req.old_path)
+    new_target = get_safe_path(req.new_path)
+    if not old_target.exists():
+        raise HTTPException(status_code=404, detail="Old path not found")
+    old_target.rename(new_target)
+    return {"status": "renamed"}
 
-    if request.method == "DELETE":
-        try:
-            target_path = safe_path(rel_path)
-            if os.path.isdir(target_path):
-                shutil.rmtree(target_path)
-            elif os.path.isfile(target_path):
-                os.remove(target_path)
-            else:
-                return jsonify({"error": "Target does not exist"}), 404
-            return jsonify({"message": "Deleted successfully"}), 200
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
+@app.post("/api/extract/{server_id}")
+async def extract_zip(server_id: str, req: ExtractRequest):
+    zip_path = get_safe_path(req.file_path)
+    dest_path = get_safe_path(req.target_path)
+    if not zip_path.exists() or not zipfile.is_zipfile(zip_path):
+        raise HTTPException(status_code=400, detail="Invalid zip file")
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        zip_ref.extractall(dest_path)
+    return {"status": "extracted"}
 
-@app.route("/api/rename/<server_id>", methods=["POST"])
-def rename_item(server_id):
-    data = request.get_json() or {}
-    old_p = data.get("old_path", "")
-    new_p = data.get("new_path", "")
-    try:
-        src = safe_path(old_p)
-        dst = safe_path(new_p)
-        os.rename(src, dst)
-        return jsonify({"message": "Renamed successfully"}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+@app.post("/api/upload/{server_id}")
+async def upload_files(
+    server_id: str,
+    path: str = Form(""),
+    file: List[UploadFile] = File(...)
+):
+    dest_dir = get_safe_path(path)
+    dest_dir.mkdir(parents=True, exist_ok=True)
 
-@app.route("/api/create_folder/<server_id>", methods=["POST"])
-def create_folder(server_id):
-    data = request.get_json() or {}
-    folder_rel = data.get("path", "").strip()
-    try:
-        target = safe_path(folder_rel)
-        os.makedirs(target, exist_ok=True)
-        return jsonify({"message": "Folder created"}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/api/upload/<server_id>", methods=["POST"])
-def upload_files(server_id):
-    upload_dir_rel = request.form.get("path", "").strip()
-    try:
-        dest_dir = safe_path(upload_dir_rel)
-        os.makedirs(dest_dir, exist_ok=True)
-
-        files = request.files.getlist("file")
-        for file in files:
-            if file and file.filename:
-                save_dest = os.path.join(dest_dir, file.filename)
-                file.save(save_dest)
-        return jsonify({"message": f"{len(files)} files uploaded"}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route("/api/extract/<server_id>", methods=["POST"])
-def extract_zip(server_id):
-    data = request.get_json() or {}
-    zip_rel = data.get("file_path", "")
-    dest_rel = data.get("target_path", "")
-    try:
-        zip_full = safe_path(zip_rel)
-        dest_full = safe_path(dest_rel)
-        if not zipfile.is_zipfile(zip_full):
-            return jsonify({"error": "Invalid zip file"}), 400
-        with zipfile.ZipFile(zip_full, 'r') as zip_ref:
-            zip_ref.extractall(dest_full)
-        return jsonify({"message": "Extracted successfully"}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    for f in file:
+        file_dest = dest_dir / f.filename
+        with open(file_dest, "wb") as buffer:
+            shutil.copyfileobj(f.file, buffer)
+    return {"status": "uploaded", "count": len(file)}
 
 
-# ==========================================
-# 5. STARTUP CONFIG ENDPOINTS
-# ==========================================
-@app.route("/api/get_startup/<server_id>", methods=["GET"])
-def get_startup_cfg(server_id):
-    return jsonify(get_config())
+# ==================== ৫. স্টার্টআপ কনফিগারেশন API ====================
+@app.get("/api/get_startup/{server_id}")
+async def get_startup(server_id: str):
+    return startup_config
 
-@app.route("/api/set_startup/<server_id>", methods=["POST"])
-def set_startup_cfg(server_id):
-    data = request.get_json() or {}
-    cfg = {
-        "main_file": data.get("main_file", "main.py"),
-        "req_file": data.get("req_file", "requirements.txt")
-    }
-    save_config(cfg)
-    return jsonify({"message": "Startup config updated"}), 200
+@app.post("/api/set_startup/{server_id}")
+async def set_startup(server_id: str, req: StartupRequest):
+    startup_config["main_file"] = req.main_file
+    startup_config["req_file"] = req.req_file
+    return {"status": "updated", "config": startup_config}
 
 
-# ==========================================
-# RUN THE APPLICATION
-# ==========================================
 if __name__ == "__main__":
-    print(f"[*] Panel running on http://localhost:5000")
-    print(f"[*] Managed Workspace directory: {WORKSPACE_DIR}")
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
